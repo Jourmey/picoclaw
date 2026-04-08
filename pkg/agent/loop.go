@@ -1650,12 +1650,38 @@ func (al *AgentLoop) handleReasoning(
 	}
 }
 
+// runTurn 是 Agent Loop 的核心心脏，处理单个"轮次"（Turn）的完整生命周期
+//
+// 核心职责：
+//  1. 管理上下文（历史、摘要）- 智能组装和压缩会话历史
+//  2. 加载工具 - 统一抽象 Tools、Skills、MCP
+//  3. 调用 LLM 推理 - 含 Fallback、重试、Hook 拦截
+//  4. 执行工具循环 - 处理工具调用和异步回调
+//  5. 处理中断和错误 - Steering 消息、超时重试、上下文溢出自动压缩
+//  6. 支持流式响应 - 通过 ChannelManager.Streamer 接口
+//
+// 执行流程：
+//
+//	初始化 Context → 组装上下文 → 加载工具 → Main Loop:
+//	┌─ Hook: BeforeLLM
+//	├─ LLM.Chat() (含 Fallback 和重试)
+//	├─ Hook: AfterLLM
+//	├─ 如果有工具调用 → Tool Loop:
+//	│  ├─ Hook: BeforeTool
+//	│  ├─ Hook: ApproveTool
+//	│  ├─ Tools.Execute()
+//	│  ├─ Hook: AfterTool
+//	│  └─ 处理结果
+//	└─ 检查中断 & 循环
+//	→ 最终化 & 返回
 func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, error) {
+	// ========== 第 1 阶段：Context 初始化 ==========
 	turnCtx, turnCancel := context.WithCancel(ctx)
 	defer turnCancel()
 	ts.setTurnCancel(turnCancel)
 
 	// Inject turnState and AgentLoop into context so tools (e.g. spawn) can retrieve them.
+	// 工具可以通过 context 访问当前 turn 的状态和 agent loop
 	turnCtx = withTurnState(turnCtx, ts)
 	turnCtx = WithAgentLoop(turnCtx, al)
 
@@ -1664,6 +1690,7 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 
 	turnStatus := TurnEndStatusCompleted
 	defer func() {
+		// 发送 turn.end 事件，记录此轮次的执行统计
 		al.emitEvent(
 			EventKindTurnEnd,
 			ts.eventMeta("runTurn", "turn.end"),
@@ -1687,10 +1714,31 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 		},
 	)
 
+	// ========== 第 2 阶段：上下文处理（Context Management） ==========
+	// 上下文处理使用三层架构：
+	//   ContextWindow (e.g., 8000 tokens)
+	//   ├─ MaxTokens (e.g., 2000 for response)
+	//   └─ Budget = ContextWindow - MaxTokens (用于历史消息)
+	//
+	// 流程：Assemble → BuildMessages → Check → Compact → Rebuild
+	//
 	var history []providers.Message
 	var summary string
 	if !ts.opts.NoHistory {
-		// ContextManager assembles budget-aware history and summary.
+		// 第 2.1 步：Assemble - 从 ContextManager 获取预算内的会话历史
+		// AssembleRequest 包含：
+		//   - SessionKey: 会话标识 (e.g., "agent_user_123")
+		//   - Budget: 剩余 token 预算 (ContextWindow - MaxTokens)
+		//   - MaxTokens: 响应最大 token 数
+		// AssembleResponse 返回：
+		//   - History: []providers.Message (过往对话)
+		//   - Summary: string (被总结的早期历史摘要)
+		// ContextManager 做什么？
+		//   1. 从 SessionStore 读取所有历史消息
+		//   2. 按优先级排序（最近的消息优先）
+		//   3. 计算每条消息的 token 数
+		//   4. 保留在预算内的最新消息
+		//   5. 返回超出预算的早期消息摘要
 		if resp, err := al.contextManager.Assemble(turnCtx, &AssembleRequest{
 			SessionKey: ts.sessionKey,
 			Budget:     ts.agent.ContextWindow,
@@ -1702,6 +1750,20 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 	}
 	ts.captureRestorePoint(history, summary)
 
+	// 第 2.2 步：BuildMessages - 组装 LLM API 需要的消息格式
+	// ContextBuilder 构建的消息列表结构：
+	//   [
+	//     {role: "system", content: "系统提示词..."},     ← 包含所有 skills 描述
+	//     {role: "user", content: "早期摘要..."},         ← 如果有压缩历史
+	//     {role: "assistant", content: "..."},
+	//     ...
+	//     {role: "user", content: ts.userMessage}        ← 当前用户消息
+	//   ]
+	// BuildMessages 内部处理：
+	//   1. 生成系统提示（包含 workspace 上下文、可用技能等）
+	//   2. 加入历史摘要（如果有）
+	//   3. 加入完整历史对话
+	//   4. 解析媒体引用（media:// URLs）并转为 base64
 	messages := ts.agent.ContextBuilder.BuildMessages(
 		history,
 		summary,
@@ -1716,16 +1778,30 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 
 	cfg := al.GetConfig()
 	maxMediaSize := cfg.Agents.Defaults.GetMaxMediaSize()
+	// 第 2.3 步：解析媒体 - 将 media:// 引用转换为 base64（用于视觉 LLM）
+	// resolveMediaRefs 做什么？
+	//   media:// URIs → 加载文件 → base64 编码 → 插入消息
+	// 例如：
+	//   输入：{role: "user", media: ["media://scope/image.jpg"]}
+	//   输出：{role: "user", content: "![image](data:image/jpeg;base64,...)"}
 	messages = resolveMediaRefs(messages, al.mediaStore, maxMediaSize)
 
 	if !ts.opts.NoHistory {
+		// 第 2.4 步：检查预算 - 检查消息列表是否超出 token 预算
 		toolDefs := ts.agent.Tools.ToProviderDefs()
 		if isOverContextBudget(ts.agent.ContextWindow, messages, toolDefs, ts.agent.MaxTokens) {
 			logger.WarnCF("agent", "Proactive compression: context budget exceeded before LLM call",
 				map[string]any{"session_key": ts.sessionKey})
+
+			// 第 2.5 步：压缩 - 主动压缩，总结早期历史以节省空间
+			// Compact 做什么？
+			//   1. 将早期历史消息聚合总结
+			//   2. 比如：50 条消息压缩成 1 条摘要
+			//   3. 实现：调用 LLM 自己生成摘要
+			//   4. 优点：保留信息，节省 token
 			if err := al.contextManager.Compact(turnCtx, &CompactRequest{
 				SessionKey: ts.sessionKey,
-				Reason:     ContextCompressReasonProactive,
+				Reason:     ContextCompressReasonProactive, // "proactive" 提前压缩
 			}); err != nil {
 				logger.WarnCF("agent", "Proactive compact failed", map[string]any{
 					"session_key": ts.sessionKey,
@@ -1733,6 +1809,8 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 				})
 			}
 			ts.refreshRestorePointFromSession(ts.agent)
+
+			// 第 2.6 步：重新组装 - 从压缩后的会话获取历史并重新组装
 			// Re-assemble from CM after compact.
 			if resp, err := al.contextManager.Assemble(turnCtx, &AssembleRequest{
 				SessionKey: ts.sessionKey,
@@ -1752,7 +1830,7 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 		}
 	}
 
-	// Save user message to session (from Incoming)
+	// 保存用户消息到会话（来自 Incoming）
 	if !ts.opts.NoHistory && (strings.TrimSpace(ts.userMessage) != "" || len(ts.media) > 0) {
 		rootMsg := providers.Message{
 			Role:    "user",
@@ -1768,6 +1846,27 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 		ts.ingestMessage(turnCtx, al, rootMsg)
 	}
 
+	// ========== 第 3 阶段：工具加载（Tool Loading） ==========
+	// 三层工具系统：
+	//
+	// 1. Tools (可执行工具)
+	//    - read_file, write_file, exec, web_search, send_message, send_tts 等
+	//    - 放在 ToolRegistry 中（在 Agent 初始化时加载）
+	//    - 通过 Tools.ToProviderDefs() 转换为 LLM 格式
+	//
+	// 2. Skills (知识库技能)
+	//    - Workspace 下的 .md 文件
+	//    - 通过 ContextBuilder.BuildMessages() 加入系统提示
+	//    - LLM 可以引用但无法"调用"
+	//
+	// 3. MCP (Model Context Protocol)
+	//    - 外部工具通过 Tool Definition 暴露
+	//    - LLM 可以动态调用
+	//
+	// 特殊检测：
+	// - Native Web Search：如果 LLM 原生支持搜索，使用原生而非工具实现
+	// - Thinking Capability：检测是否支持 o1、Claude Opus 的思考模式
+	//
 	activeCandidates, activeModel, usedLight := al.selectCandidates(ts.agent, ts.userMessage, messages)
 	activeProvider := ts.agent.Provider
 	if usedLight && ts.agent.LightProvider != nil {
@@ -1776,7 +1875,47 @@ func (al *AgentLoop) runTurn(ctx context.Context, ts *turnState) (turnResult, er
 	pendingMessages := append([]providers.Message(nil), ts.opts.InitialSteeringMessages...)
 	var finalContent string
 
+	// ========== 第 4 阶段：Main Loop - LLM 推理循环 ==========
+	// 这是核心推理循环，可能执行多次迭代（最多 MaxIterations 次）
+	// 每次迭代：Hook: BeforeLLM → LLM.Chat() → Hook: AfterLLM → Tool Loop → 检查中断
+	//
 turnLoop:
+	// ========== 循环条件详解 ==========
+	// 这个循环条件有三个部分，用 OR 连接，满足任意一个就继续循环：
+	//
+	// 1. ts.currentIteration() < ts.agent.MaxIterations
+	//    └─ 当前迭代次数 < 最大迭代次数
+	//    └─ 例如：MaxIterations=10，已执行 5 次，则继续
+	//    └─ 作用：限制最多执行的 LLM 推理次数，防止无限循环
+	//
+	// 2. len(pendingMessages) > 0
+	//    └─ 有待处理的消息队列
+	//    └─ 包括：Steering 消息（用户指导）+ SubTurn 结果
+	//    └─ 作用：即使达到 MaxIterations，如果用户有新消息，仍继续处理
+	//    └─ 场景：用户在 LLM 推理中途发送新指令 → 必须先处理这些指令
+	//
+	// 3. func() bool { graceful, _ := ts.gracefulInterruptRequested(); return graceful }()
+	//    └─ 用匿名函数检查是否请求了 graceful 中断
+	//    └─ Graceful Interrupt（优雅中断）：完成当前工作再停止
+	//    └─ 作用：即使达到 MaxIterations 且无待处理消息，
+	//       如果用户请求 graceful 中断，也要继续一次迭代
+	//       这样可以完成当前正在执行的工具调用
+	//
+	// 连接逻辑（三个条件都用 OR）：
+	//   condition1 || condition2 || condition3
+	//   满足任何一个 → 继续循环
+	//   全部不满足 → 退出循环
+	//
+	// 循环继续条件：
+	//   ✓ 还有迭代次数剩余
+	//   或 ✓ 有待处理的用户消息（Steering/SubTurn）
+	//   或 ✓ 用户请求了优雅中断（需要完成当前轮次）
+	//
+	// 循环停止条件（同时满足）：
+	//   ✗ 达到最大迭代次数
+	//   且 ✗ 没有待处理消息
+	//   且 ✗ 没有 graceful 中断请求（或已处理）
+	//
 	for ts.currentIteration() < ts.agent.MaxIterations || len(pendingMessages) > 0 || func() bool {
 		graceful, _ := ts.gracefulInterruptRequested()
 		return graceful
@@ -1869,9 +2008,23 @@ turnLoop:
 			})
 
 		gracefulTerminal, _ := ts.gracefulInterruptRequested()
+
+		// 第 3.1 步：获取工具定义 - 将 ToolRegistry 转换为 LLM 提供商能理解的格式
+		// ToProviderDefs() 返回：[]providers.ToolDefinition
+		// 格式示例：
+		//   {
+		//     "type": "function",
+		//     "function": {
+		//       "name": "read_file",
+		//       "description": "Read a file from the workspace",
+		//       "parameters": {type: "object", properties: {...}}
+		//     }
+		//   }
 		providerToolDefs := ts.agent.Tools.ToProviderDefs()
 
-		// Native web search support (from HEAD)
+		// 第 3.2 步：检测原生 Web Search 支持
+		// 如果 LLM 原生支持 web search（如 Claude、OpenAI）
+		// 则使用原生而非工具实现（更快、更准确）
 		_, hasWebSearch := ts.agent.Tools.Get("web_search")
 		useNativeSearch := al.cfg.Tools.Web.PreferNative &&
 			hasWebSearch &&
@@ -1884,7 +2037,7 @@ turnLoop:
 			}()
 
 		if useNativeSearch {
-			// Filter out client-side web_search tool
+			// 移除客户端实现的 web_search tool，使用原生搜索
 			filtered := make([]providers.ToolDefinition, 0, len(providerToolDefs))
 			for _, td := range providerToolDefs {
 				if td.Function.Name != "web_search" {
@@ -1892,33 +2045,47 @@ turnLoop:
 				}
 			}
 			providerToolDefs = filtered
+			// 在 LLM 选项中启用原生搜索
 		}
 
+		// 第 3.3 步：处理媒体引用
 		// Resolve media:// refs produced by tool results (e.g. load_image).
-		// Skipped on iteration 1 because inbound user media is already resolved
-		// before entering the loop; only subsequent iterations can contain new
-		// tool-generated media refs that need base64 encoding.
+		// 注意：第 1 次迭代跳过，因为入站媒体已在循环前解析
+		// 只有后续迭代才能产生新的工具生成媒体
 		if iteration > 1 {
 			messages = resolveMediaRefs(messages, al.mediaStore, maxMediaSize)
 		}
 
+		// 第 3.4 步：构建 LLM 调用消息
 		callMessages := messages
 		if gracefulTerminal {
+			// 如果用户请求 graceful 中断（优雅停止）
+			// 添加中断提示消息，禁用工具调用
 			callMessages = append(append([]providers.Message(nil), messages...), ts.interruptHintMessage())
 			providerToolDefs = nil
 			ts.markGracefulTerminalUsed()
 		}
 
+		// 第 3.5 步：构建 LLM 选项
+		// 这些选项会传递给 LLM API
 		llmOpts := map[string]any{
-			"max_tokens":       ts.agent.MaxTokens,
-			"temperature":      ts.agent.Temperature,
-			"prompt_cache_key": ts.agent.ID,
+			"max_tokens":       ts.agent.MaxTokens,   // 最大输出 token 数
+			"temperature":      ts.agent.Temperature, // 温度（控制多样性）
+			"prompt_cache_key": ts.agent.ID,          // 提示词缓存键
 		}
 		if useNativeSearch {
-			llmOpts["native_search"] = true
+			llmOpts["native_search"] = true // 启用原生 web search
 		}
+
+		// 第 3.6 步：检测 Thinking 能力
+		// 检查 LLM 是否支持 Thinking（内部推理，如 o1、Claude Opus）
 		if ts.agent.ThinkingLevel != ThinkingOff {
 			if tc, ok := ts.agent.Provider.(providers.ThinkingCapable); ok && tc.SupportsThinking() {
+				// 启用 thinking
+				// ThinkingLevel 可选：
+				//   - "off"     (默认)
+				//   - "simple"  (轻量思考)
+				//   - "extended" (深度思考)
 				llmOpts["thinking_level"] = string(ts.agent.ThinkingLevel)
 			} else {
 				logger.WarnCF("agent", "thinking_level is set but current provider does not support it, ignoring",
@@ -1926,6 +2093,13 @@ turnLoop:
 			}
 		}
 
+		// ========== 第 4.1 步：Hook: BeforeLLM - 允许自定义修改 LLM 请求 ==========
+		// Hook 允许在 LLM 调用前拦截和修改参数
+		// 决策选项：
+		//   - HookActionContinue/Modify: 继续（可选修改）
+		//   - HookActionAbortTurn: 中止此轮次
+		//   - HookActionHardAbort: 中止并清理（激进）
+		//
 		llmModel := activeModel
 		if al.hooks != nil {
 			llmReq, decision := al.hooks.BeforeLLM(turnCtx, &LLMHookRequest{
@@ -1940,6 +2114,7 @@ turnLoop:
 			})
 			switch decision.normalizedAction() {
 			case HookActionContinue, HookActionModify:
+				// Hook 可能修改了请求参数
 				if llmReq != nil {
 					llmModel = llmReq.Model
 					callMessages = llmReq.Messages
@@ -1986,6 +2161,10 @@ turnLoop:
 				"tools_json":    formatToolsForLog(providerToolDefs),
 			})
 
+		// 第 4.2 步：定义 callLLM 闭包 - 实际调用 LLM API
+		// 包含两个重要机制：
+		//   1. Fallback 机制：多个 LLM 候选自动切换
+		//   2. 错误处理：失败时返回错误供外层重试
 		callLLM := func(messagesForCall []providers.Message, toolDefsForCall []providers.ToolDefinition) (*providers.LLMResponse, error) {
 			providerCtx, providerCancel := context.WithCancel(turnCtx)
 			ts.setProviderCancel(providerCancel)
@@ -1997,6 +2176,9 @@ turnLoop:
 			al.activeRequests.Add(1)
 			defer al.activeRequests.Done()
 
+			// Fallback 机制：多个 LLM 候选自动切换
+			// 如果有多个模型候选（如 [Claude, GPT-4, Gemini]）且 Fallback 已初始化
+			// 按顺序尝试，失败后尝试下一个
 			if len(activeCandidates) > 1 && al.fallback != nil {
 				fbResult, fbErr := al.fallback.Execute(
 					providerCtx,
@@ -2021,13 +2203,20 @@ turnLoop:
 			return activeProvider.Chat(providerCtx, messagesForCall, toolDefsForCall, llmModel, llmOpts)
 		}
 
+		// ========== 第 4.3 步：LLM 调用与重试逻辑 ==========
+		// 智能重试机制：
+		//   - 超时错误：指数退避重试（5s、10s）
+		//   - 上下文溢出：自动压缩历史 → 重新组装 → 重试
+		//   - 其他错误：不重试，直接返回
+		// 最多重试 2 次（总共最多 3 次调用）
+		//
 		var response *providers.LLMResponse
 		var err error
 		maxRetries := 2
 		for retry := 0; retry <= maxRetries; retry++ {
 			response, err = callLLM(callMessages, providerToolDefs)
 			if err == nil {
-				break
+				break // 成功！
 			}
 			if ts.hardAbortRequested() && errors.Is(err, context.Canceled) {
 				turnStatus = TurnEndStatusAborted
@@ -2162,6 +2351,13 @@ turnLoop:
 			return turnResult{}, fmt.Errorf("LLM call failed after retries: %w", err)
 		}
 
+		// ========== 第 4.4 步：Hook: AfterLLM - 处理 LLM 响应 ==========
+		// Hook 允许在 LLM 返回后拦截和修改响应
+		// 决策选项：
+		//   - HookActionContinue/Modify: 继续（可选修改）
+		//   - HookActionAbortTurn: 中止此轮次
+		//   - HookActionHardAbort: 中止并清理（激进）
+		//
 		if al.hooks != nil {
 			llmResp, decision := al.hooks.AfterLLM(turnCtx, &LLMHookResponse{
 				Meta:     ts.eventMeta("runTurn", "turn.llm.response"),

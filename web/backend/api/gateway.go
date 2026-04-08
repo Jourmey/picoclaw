@@ -155,7 +155,7 @@ func (h *Handler) registerGatewayRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/gateway/status", h.handleGatewayStatus)
 	mux.HandleFunc("GET /api/gateway/logs", h.handleGatewayLogs)
 	mux.HandleFunc("POST /api/gateway/logs/clear", h.handleGatewayClearLogs)
-	mux.HandleFunc("POST /api/gateway/start", h.handleGatewayStart)
+	mux.HandleFunc("POST /api/gateway/start", h.handleGatewayStart) // 启动项目服务
 	mux.HandleFunc("POST /api/gateway/stop", h.handleGatewayStop)
 	mux.HandleFunc("POST /api/gateway/restart", h.handleGatewayRestart)
 }

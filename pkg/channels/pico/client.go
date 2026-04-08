@@ -19,12 +19,48 @@ import (
 	"github.com/sipeed/picoclaw/pkg/logger"
 )
 
-// PicoClientChannel connects to a remote Pico Protocol WebSocket server.
+// PicoClientChannel 实现了 Pico Protocol WebSocket 客户端频道。
+// 它是一个单连接的 WebSocket 客户端实现，主动连接到远程服务器。
+//
+// 角色: 💻 客户端端
+//
+// 职责:
+//   - 主动连接到远程 Pico Protocol 服务器
+//   - 与远程服务器保持长连接
+//   - 转发本地消息到远程服务器
+//   - 接收远程服务器的消息并转发到本地 MessageBus
+//
+// 关键特性:
+//   - 单连接设计: 只维护一个到远程服务器的连接
+//   - 自动重连: reconnectLoop() 在连接断开时自动重连
+//   - Token 认证: 使用 Authorization Bearer token 连接到远程服务器
+//   - 心跳检测: 定期发送 ping 消息保持连接活跃
+//   - 优雅关闭: 关闭连接后清理资源
+//
+// 应用场景:
+//   - 连接到其他 PicoClaw 实例: 组成分布式 AI 系统
+//   - 连接第三方 Pico 服务: 集成外部系统
+//   - 消息转发和桥接: 连接多个独立的 AI 服务
+//
+// 工作流程:
+//   1. Start() 初始化并主动拨号连接到远程服务器
+//   2. dial() 建立 WebSocket 连接，创建 picoConn
+//   3. readLoop() 读取远程服务器的消息，转发到本地 MessageBus
+//   4. reconnectLoop() 在连接断开时自动重连（指数退避）
+//   5. Send() 将本地消息发送到远程服务器
+//   6. Stop() 关闭连接并停止所有 goroutine
+//
+// 与 PicoChannel 的对比:
+//   PicoChannel (服务器):       PicoClientChannel (客户端):
+//   - 接收连接                   - 发起连接
+//   - 多连接                     - 单连接
+//   - 等待客户端                 - 主动拨号
+//   - 需要监听 HTTP 端口         - 不需要监听端口
 type PicoClientChannel struct {
 	*channels.BaseChannel
 	config config.PicoClientConfig
-	conn   *picoConn
-	mu     sync.Mutex
+	conn   *picoConn              // 到远程服务器的单一连接
+	mu     sync.Mutex             // 保护 conn 字段的并发访问
 	ctx    context.Context
 	cancel context.CancelFunc
 }

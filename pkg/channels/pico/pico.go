@@ -50,15 +50,40 @@ func (pc *picoConn) close() {
 	}
 }
 
-// PicoChannel implements the native Pico Protocol WebSocket channel.
-// It serves as the reference implementation for all optional capability interfaces.
+// PicoChannel 实现了 Pico Protocol WebSocket 服务器频道。
+// 它是一个多连接的 WebSocket 服务器实现，支持多个客户端同时连接。
+//
+// 角色: 🖥️ 服务器端
+//
+// 职责:
+//   - 作为 HTTP WebSocket 服务器运行
+//   - 接收来自外部客户端的连接请求
+//   - 处理来自多个客户端的并发消息
+//   - 管理会话(session)与连接的关系
+//
+// 关键特性:
+//   - 多连接管理: 支持同一会话下的多个并发客户端连接
+//   - Token 认证: 通过 Authorization Bearer token 验证客户端
+//   - 跨源支持: 配置 AllowOrigins 支持特定的客户端来源
+//   - 消息广播: 支持向同一会话内的所有连接广播消息
+//   - 心跳检测: 自动发送 ping 消息检测连接存活
+//   - 优雅关闭: 清理所有连接和资源
+//
+// 工作流程:
+//   1. Start() 启动服务器，注册 HTTP 处理器
+//   2. ServeHTTP() 处理 HTTP 请求
+//   3. handleWebSocket() 处理 WebSocket 升级
+//   4. readLoop() 读取客户端消息，启动 pingLoop
+//   5. 消息通过 MessageBus 转发到 AI 引擎处理
+//   6. Send() 将响应消息发送回客户端
+//   7. Stop() 关闭所有连接并清理资源
 type PicoChannel struct {
 	*channels.BaseChannel
 	config             config.PicoConfig
 	upgrader           websocket.Upgrader
-	connections        map[string]*picoConn            // connID -> *picoConn
-	sessionConnections map[string]map[string]*picoConn // sessionID -> connID -> *picoConn
-	connsMu            sync.RWMutex
+	connections        map[string]*picoConn            // connID -> *picoConn (所有连接)
+	sessionConnections map[string]map[string]*picoConn // sessionID -> connID -> *picoConn (按会话分组)
+	connsMu            sync.RWMutex                    // 保护上述两个映射的并发访问
 	ctx                context.Context
 	cancel             context.CancelFunc
 }
